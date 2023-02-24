@@ -7,44 +7,52 @@
 #include "ublksrv_tgt.h"
 
 //supposed to be from kernel header
-#define IORING_OP_READ_SPLICE_BUF (IORING_OP_SENDMSG_ZC + 1)
-#define IORING_OP_WRITE_SPLICE_BUF (IORING_OP_SENDMSG_ZC + 2)
+#define IORING_OP_FUSED_CMD (IORING_OP_SENDMSG_ZC + 1)
 
 static long use_zc;
 
-static inline void io_uring_prep_rw_zc(int op, struct io_uring_sqe *sqe, int fd,
-                         unsigned len, __u64 offset, int splice_fd,
-			 __u64 splice_offset)
+static inline void io_uring_prep_master(struct io_uring_sqe *sqe, int dev_fd,
+		int tag, int q_id)
 {
-        sqe->opcode = (__u8) op;
-        sqe->flags = 0;
-        sqe->ioprio = 0;
-        sqe->fd = fd;
-        sqe->off = offset;
-        sqe->splice_off_in = splice_offset;
-        sqe->len = len;
-        sqe->rw_flags = 0;
-        sqe->buf_index = 0;
-        sqe->personality = 0;
-        sqe->splice_fd_in = splice_fd;
-        sqe->addr3 = 0;
-        sqe->__pad2[0] = 0;
+	struct ublksrv_io_cmd *cmd = (struct ublksrv_io_cmd *)sqe->cmd;
+
+	sqe->fd			= dev_fd;
+	sqe->opcode		= IORING_OP_FUSED_CMD;
+	sqe->flags		= IOSQE_FIXED_FILE;
+	sqe->uring_cmd_flags	= 0;
+	sqe->cmd_op		= UBLK_IO_FUSED_SUBMIT_IO;
+	sqe->__pad1		= 0;
+
+	cmd->tag	= tag;
+	cmd->addr	= 0;
+	cmd->q_id	= q_id;
 }
 
-static void io_uring_prep_read_zc(struct io_uring_sqe *sqe, int fd,
-                         unsigned len, __u64 offset, int splice_fd,
-			 __u64 splice_offset)
+static inline void io_uring_prep_read_zc(struct io_uring_sqe *sqe, int dev_fd,
+		const struct ublksrv_io_desc *iod, int tag, int q_id, __u8 fd)
 {
-	io_uring_prep_rw_zc(IORING_OP_READ_SPLICE_BUF, sqe, fd, len, offset,
-			splice_fd, splice_offset);
+	struct io_uring_sqe *slave = sqe + 1;
+
+	io_uring_prep_master(sqe, dev_fd, tag, q_id);
+
+	io_uring_prep_read(slave, fd, (void *)0, iod->nr_sectors << 9,
+			iod->start_sector << 9);
+	io_uring_sqe_set_flags(slave, IOSQE_FIXED_FILE |
+			IOSQE_CQE_SKIP_SUCCESS);
+	slave->user_data = build_user_data(tag, UBLK_IO_OP_READ, 1, 1);
 }
 
-static void io_uring_prep_write_zc(struct io_uring_sqe *sqe, int fd,
-                         unsigned len, __u64 offset, int splice_fd,
-			 __u64 splice_offset)
+static inline void io_uring_prep_write_zc(struct io_uring_sqe *sqe, int dev_fd,
+		const struct ublksrv_io_desc *iod, int tag, int q_id, __u8 fd)
 {
-	io_uring_prep_rw_zc(IORING_OP_WRITE_SPLICE_BUF, sqe, fd, len, offset,
-			splice_fd, splice_offset);
+	struct io_uring_sqe *slave = sqe + 1;
+
+	io_uring_prep_master(sqe, dev_fd, tag, q_id);
+	io_uring_prep_write(slave, fd, (void *)0, iod->nr_sectors << 9,
+			iod->start_sector << 9);
+	io_uring_sqe_set_flags(slave, IOSQE_FIXED_FILE |
+			IOSQE_CQE_SKIP_SUCCESS);
+	slave->user_data = build_user_data(tag, UBLK_IO_OP_WRITE, 1, 1);
 }
 
 static bool backing_supports_discard(char *name)
@@ -296,11 +304,9 @@ static inline int loop_fallocate_mode(const struct ublksrv_io_desc *iod)
 static int loop_queue_tgt_io(const struct ublksrv_queue *q,
 		const struct ublk_io_data *data, int tag)
 {
-	int splice_fd = q->dev->tgt.fds[0];
 	const struct ublksrv_io_desc *iod = data->iod;
 	struct io_uring_sqe *sqe = io_uring_get_sqe(q->ring_ptr);
 	unsigned ublk_op = ublksrv_get_op(iod);
-	unsigned long long ublkc_off = ublk_pos(q->q_id, tag, 0);
 
 	if (!sqe)
 		return 0;
@@ -328,10 +334,8 @@ static int loop_queue_tgt_io(const struct ublksrv_queue *q,
 					iod->nr_sectors << 9,
 					iod->start_sector << 9);
 		else
-			io_uring_prep_read_zc(sqe, 1,
-					iod->nr_sectors << 9,
-					iod->start_sector << 9,
-					splice_fd, ublkc_off);
+			io_uring_prep_read_zc(sqe, 0,
+					iod, tag, q->q_id, 1);
 		io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE);
 		break;
 	case UBLK_IO_OP_WRITE:
@@ -341,10 +345,8 @@ static int loop_queue_tgt_io(const struct ublksrv_queue *q,
 				iod->nr_sectors << 9,
 				iod->start_sector << 9);
 		else
-			io_uring_prep_write_zc(sqe, 1,
-					iod->nr_sectors << 9,
-					iod->start_sector << 9,
-					splice_fd, ublkc_off);
+			io_uring_prep_write_zc(sqe, 0,
+					iod, tag, q->q_id, 1);
 		io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE);
 		break;
 	default:
@@ -380,6 +382,10 @@ static co_io_job __loop_handle_io_async(const struct ublksrv_queue *q,
 
 		co_await__suspend_always(tag);
 		io->queued_tgt_io -= 1;
+
+		/* in case of zc, got slave request failure, wait for master cqe */
+		if (user_data_to_tgt_data(io->tgt_io_cqe->user_data))
+			co_await__suspend_always(tag);
 
 		if (io->tgt_io_cqe->res == -EAGAIN)
 			goto again;
