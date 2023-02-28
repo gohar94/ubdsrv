@@ -10,6 +10,7 @@
 //#define NBD_DEBUG_HANDSHAKE 1
 //#define NBD_DEBUG_IO 1
 //#define NBD_DEBUG_CQE 1
+//#define NBD_REPLACE_ZC_WITH_TWO_SENDS 1
 
 #ifdef NBD_DEBUG_IO
 #define NBD_IO_DBG  ublk_err
@@ -117,6 +118,9 @@ static inline void io_uring_prep_send_ublk_zc(struct io_uring_sqe *sqe, int dev_
 		int tag, int q_id, int fd, void *buf, unsigned offset,
 		unsigned len, unsigned msg_flags)
 {
+#ifdef NBD_REPLACE_ZC_WITH_TWO_SENDS
+	io_uring_prep_send(sqe, fd, (char *)buf + offset, len, msg_flags);
+#else
 	struct io_uring_sqe *slave = sqe + 1;
 
 	io_uring_prep_master(sqe, dev_fd, tag, q_id);
@@ -124,11 +128,15 @@ static inline void io_uring_prep_send_ublk_zc(struct io_uring_sqe *sqe, int dev_
 	io_uring_prep_send(slave, fd, (void *)(u64)offset, len, msg_flags);
 	io_uring_sqe_set_flags(slave, IOSQE_FIXED_FILE |
 			IOSQE_CQE_SKIP_SUCCESS | IOSQE_IO_LINK);
+#endif
 }
 
 static inline void io_uring_prep_recv_ublk_zc(struct io_uring_sqe *sqe, int dev_fd,
 		int tag, int q_id, int fd, void *buf, unsigned offset, unsigned len)
 {
+#ifdef NBD_REPLACE_ZC_WITH_TWO_SENDS
+	io_uring_prep_recv(sqe, fd, (char *)buf + offset, len, MSG_WAITALL);
+#else
 	struct io_uring_sqe *slave = sqe + 1;
 
 	io_uring_prep_master(sqe, dev_fd, tag, q_id);
@@ -136,6 +144,7 @@ static inline void io_uring_prep_recv_ublk_zc(struct io_uring_sqe *sqe, int dev_
 	io_uring_prep_recv(slave, fd, (void *)(u64)offset, len, MSG_WAITALL);
 	io_uring_sqe_set_flags(slave, IOSQE_FIXED_FILE |
 			IOSQE_CQE_SKIP_SUCCESS);
+#endif
 }
 
 static inline struct nbd_queue_data *
@@ -1008,6 +1017,10 @@ static void nbd_setup_tgt(struct ublksrv_dev *dev, int type, bool recovery,
 	tgt->dev_size = size64;
 
 	use_zc = info->flags & UBLK_F_SUPPORT_ZERO_COPY;
+#ifdef NBD_REPLACE_ZC_WITH_TWO_SENDS
+	use_zc = 1;
+#endif
+
 	/*
 	 * one extra slot for receiving reply & read io, so
 	 * the preferred queue depth should be 127 or 255,
