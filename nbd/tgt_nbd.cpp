@@ -191,8 +191,12 @@ static inline int nbd_prep_write_sqe(const struct ublksrv_queue *q,
 {
 	struct io_uring_sqe *sqe2 = io_uring_get_sqe(q->ring_ptr);
 
-	if (!sqe2)
+	if (!sqe2) {
+		nbd_err("%s: get sqe failed, op %d\n",
+				__func__, ublk_op);
+		exit(-1);
 		return -ENOMEM;
+	}
 
 	io_uring_prep_send(sqe, fd, msg->msg_iov[0].iov_base,
 			msg->msg_iov[0].iov_len, msg_flags);
@@ -261,6 +265,7 @@ static int nbd_queue_req(const struct ublksrv_queue *q,
 	if (!sqe) {
 		nbd_err("%s: get sqe failed, tag %d op %d\n",
 				__func__, data->tag, ublk_op);
+		exit(-1);
 		return -ENOMEM;
 	}
 
@@ -471,6 +476,7 @@ static inline int nbd_start_recv(const struct ublksrv_queue *q,
 	if (!sqe) {
 		nbd_err("%s: get sqe failed, len %d reply %d done %d\n",
 				__func__, len, reply, done);
+		exit(-1);
 		return -ENOMEM;
 	}
 
