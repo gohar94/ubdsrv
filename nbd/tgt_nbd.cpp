@@ -11,6 +11,8 @@
 //#define NBD_DEBUG_IO 1
 //#define NBD_DEBUG_CQE 1
 //#define NBD_REPLACE_ZC_WITH_TWO_SENDS 1
+#define NBD_OP_SEND_SLAVE  0x83
+#define NBD_OP_RECV_SLAVE  0x84
 
 #ifdef NBD_DEBUG_IO
 #define NBD_IO_DBG  ublk_err
@@ -113,6 +115,31 @@ static inline void io_uring_prep_master(struct io_uring_sqe *sqe, int dev_fd,
 	cmd->addr	= 0;
 	cmd->q_id	= q_id;
 }
+
+#ifdef HAVE_LIBURING_SEND_ZC
+static inline void io_uring_prep_send_zc_ublk_zc(struct io_uring_sqe *sqe, int dev_fd,
+		int tag, int q_id, int fd, void *buf, unsigned offset,
+		unsigned len, unsigned msg_flags)
+{
+#ifdef NBD_REPLACE_ZC_WITH_TWO_SENDS
+	io_uring_prep_send_zc(sqe, fd, (char *)buf + offset, len, msg_flags, 0);
+	io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE |
+			/*IOSQE_CQE_SKIP_SUCCESS |*/ IOSQE_IO_LINK);
+	sqe->user_data = build_user_data(tag, NBD_OP_SEND_SLAVE, len >> 9, 1);
+#else
+	struct io_uring_sqe *slave = sqe + 1;
+
+	io_uring_prep_master(sqe, dev_fd, tag, q_id);
+
+	io_uring_prep_send_zc(slave, fd, (void *)(u64)offset, len, msg_flags, 0);
+	io_uring_sqe_set_flags(slave, IOSQE_FIXED_FILE |
+			/*IOSQE_CQE_SKIP_SUCCESS |*/ IOSQE_IO_LINK);
+	slave->user_data = build_user_data(tag, NBD_OP_SEND_SLAVE, len >> 9, 1);
+#endif
+}
+#else
+static inline void io_uring_prep_send_zc_ublk_zc io_uring_prep_send_ublk_zc
+#endif
 
 static inline void io_uring_prep_send_ublk_zc(struct io_uring_sqe *sqe, int dev_fd,
 		int tag, int q_id, int fd, void *buf, unsigned offset,
@@ -257,21 +284,14 @@ static inline int nbd_prep_write_sqe_zc(const struct ublksrv_queue *q,
 	io_uring_sqe_set_flags(sqe, /*IOSQE_CQE_SKIP_SUCCESS |*/
 			IOSQE_FIXED_FILE | IOSQE_IO_LINK);
 
-	if (use_send_zc) {
-#ifndef HAVE_LIBURING_SEND_ZC
-		io_uring_prep_send_zc(sqe2, fd, msg->msg_iov[1].iov_base,
-			msg->msg_iov[1].iov_len, msg_flags, 0);
-#else
-		io_uring_prep_send(sqe2, fd, msg->msg_iov[1].iov_base,
-			msg->msg_iov[1].iov_len, msg_flags);
-#endif
-	} else {
-		//io_uring_prep_send(sqe2, fd, msg->msg_iov[1].iov_base,
-		//	msg->msg_iov[1].iov_len, msg_flags);
+	if (use_send_zc)
+		io_uring_prep_send_zc_ublk_zc(sqe2, 0, data->tag, q->q_id, fd,
+				msg->msg_iov[1].iov_base, 0,
+				msg->msg_iov[1].iov_len, msg_flags);
+	else
 		io_uring_prep_send_ublk_zc(sqe2, 0, data->tag, q->q_id, fd,
 				msg->msg_iov[1].iov_base, 0,
 				msg->msg_iov[1].iov_len, msg_flags);
-	}
 	sqe2->user_data = build_user_data(data->tag, UBLK_IO_OP_WRITE, nr_sects, 1);
 	io_uring_sqe_set_flags(sqe2, IOSQE_FIXED_FILE | IOSQE_IO_LINK);
 
@@ -705,6 +725,9 @@ static void nbd_send_req_done(const struct ublksrv_queue *q,
 
 	/* nothing to do for send_zc notification */
 	if (cqe->flags & IORING_CQE_F_NOTIF)
+		return;
+
+	if (ublk_op == NBD_OP_SEND_SLAVE)
 		return;
 
 	ublk_assert(q_data->chained_send_ios);
