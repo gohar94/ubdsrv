@@ -786,7 +786,15 @@ static void nbd_handle_send_bg(const struct ublksrv_queue *q,
 			q_data->send_sqe_chain_busy = 1;
 	}
 	if (q_data->last_send_sqe) {
-		q_data->last_send_sqe->flags &= ~IOSQE_IO_LINK;
+		struct io_uring_sqe *sqe = q_data->last_send_sqe;
+
+		sqe->flags &= ~IOSQE_IO_LINK;
+		if (sqe->opcode == IORING_OP_FUSED_CMD) {
+			struct io_uring_sqe *slave = sqe + 1;
+
+			slave->flags &= ~IOSQE_IO_LINK;
+		}
+
 		q_data->last_send_sqe = NULL;
 	}
 }
