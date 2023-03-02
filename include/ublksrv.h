@@ -289,6 +289,25 @@ static inline unsigned int user_data_to_tgt_data(__u64 user_data)
 	return (user_data >> 24) & 0xffff;
 }
 
+//supposed to be from kernel header
+#define IORING_OP_FUSED_CMD (IORING_OP_SENDMSG_ZC + 1)
+static inline void io_uring_prep_fused_master(struct io_uring_sqe *sqe,
+		int dev_fd, int tag, int q_id, __u64 __addr)
+{
+	struct ublksrv_io_cmd *cmd = (struct ublksrv_io_cmd *)sqe->cmd;
+
+	sqe->fd			= dev_fd;
+	sqe->opcode		= IORING_OP_FUSED_CMD;
+	sqe->flags		= IOSQE_FIXED_FILE;
+	sqe->uring_cmd_flags	= 0;
+	sqe->cmd_op		= UBLK_IO_FUSED_SUBMIT_IO;
+	sqe->__pad1		= 0;
+
+	cmd->tag	= tag;
+	cmd->addr	= __addr;
+	cmd->q_id	= q_id;
+}
+
 /*
  * ublksrv control device APIs, for sending control commands
  * to /dev/ublk-control
