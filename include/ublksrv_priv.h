@@ -24,7 +24,6 @@
 #include "ublksrv.h"
 #include "ublksrv_aio.h"
 
-
 /* todo: relace the hardcode name with /dev/char/maj:min */
 #define UBLKC_DEV	"/dev/ublkc"
 #define UBLKC_PATH_MAX	32

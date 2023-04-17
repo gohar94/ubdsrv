@@ -8,6 +8,7 @@
 
 #define CTRL_CMD_HAS_DATA	1
 #define CTRL_CMD_HAS_BUF	2
+#define CTRL_CMD_NO_TRANS	4
 
 struct ublksrv_ctrl_cmd_data {
 	unsigned short cmd_op;
@@ -33,6 +34,19 @@ struct ublksrv_ctrl_cmd_data {
 		data.addr = (__u64)buf;	\
 	}
 
+static const unsigned int ctrl_cmd_op[] = {
+	[UBLK_CMD_GET_QUEUE_AFFINITY]	= UBLK_U_CMD_GET_QUEUE_AFFINITY,
+	[UBLK_CMD_GET_DEV_INFO]		= UBLK_U_CMD_GET_DEV_INFO,
+	[UBLK_CMD_ADD_DEV]		= UBLK_U_CMD_ADD_DEV,
+	[UBLK_CMD_DEL_DEV]		= UBLK_U_CMD_DEL_DEV,
+	[UBLK_CMD_START_DEV]		= UBLK_U_CMD_START_DEV,
+	[UBLK_CMD_STOP_DEV]		= UBLK_U_CMD_STOP_DEV,
+	[UBLK_CMD_SET_PARAMS]		= UBLK_U_CMD_SET_PARAMS,
+	[UBLK_CMD_GET_PARAMS]		= UBLK_U_CMD_GET_PARAMS,
+	[UBLK_CMD_START_USER_RECOVERY]	= UBLK_U_CMD_START_USER_RECOVERY,
+	[UBLK_CMD_END_USER_RECOVERY]	= UBLK_U_CMD_END_USER_RECOVERY,
+	[UBLK_CMD_GET_DEV_INFO2]	= UBLK_U_CMD_GET_DEV_INFO2,
+};
 
 /*******************ctrl dev operation ********************************/
 static inline void ublksrv_ctrl_init_cmd(struct ublksrv_ctrl_dev *dev,
@@ -41,6 +55,7 @@ static inline void ublksrv_ctrl_init_cmd(struct ublksrv_ctrl_dev *dev,
 {
 	struct ublksrv_ctrl_dev_info *info = &dev->dev_info;
 	struct ublksrv_ctrl_cmd *cmd = (struct ublksrv_ctrl_cmd *)ublksrv_get_sqe_cmd(sqe);
+	unsigned int cmd_op = data->cmd_op;
 
 	sqe->fd = dev->ctrl_fd;
 	sqe->opcode = IORING_OP_URING_CMD;
@@ -59,11 +74,14 @@ static inline void ublksrv_ctrl_init_cmd(struct ublksrv_ctrl_dev *dev,
 	cmd->dev_id = info->dev_id;
 	cmd->queue_id = -1;
 
-	ublksrv_set_sqe_cmd_op(sqe, data->cmd_op);
+	if (!(data->flags & CTRL_CMD_NO_TRANS) &&
+			(info->flags & UBLK_F_CMD_IOCTL_ENCODE))
+		cmd_op = ctrl_cmd_op[cmd_op];
+	ublksrv_set_sqe_cmd_op(sqe, cmd_op);
 
 	io_uring_sqe_set_data(sqe, cmd);
 
-	ublk_ctrl_dbg(UBLK_DBG_CTRL_CMD, "dev %d cmd_op %u, user_data %p\n",
+	ublk_ctrl_dbg(UBLK_DBG_CTRL_CMD, "dev %d cmd_op %x, user_data %p\n",
 			dev->dev_info.dev_id, data->cmd_op, cmd);
 }
 
@@ -236,16 +254,26 @@ int ublksrv_ctrl_start_dev(struct ublksrv_ctrl_dev *ctrl_dev,
  * 3) the ublk daemon figures out that all sqes are completed, and free,
  * then close /dev/ublkcN and exit itself.
  */
-int ublksrv_ctrl_add_dev(struct ublksrv_ctrl_dev *dev)
+static int __ublksrv_ctrl_add_dev(struct ublksrv_ctrl_dev *dev, unsigned cmd_op)
 {
 	struct ublksrv_ctrl_cmd_data data = {
-		.cmd_op	= UBLK_CMD_ADD_DEV,
-		.flags	= CTRL_CMD_HAS_BUF,
+		.cmd_op	= cmd_op,
+		.flags	= CTRL_CMD_HAS_BUF | CTRL_CMD_NO_TRANS,
 		.addr = (__u64)&dev->dev_info,
 		.len = sizeof(struct ublksrv_ctrl_dev_info),
 	};
 
 	return __ublksrv_ctrl_cmd(dev, &data);
+}
+
+int ublksrv_ctrl_add_dev(struct ublksrv_ctrl_dev *dev)
+{
+	int ret = __ublksrv_ctrl_add_dev(dev, UBLK_U_CMD_ADD_DEV);
+
+	if (ret < 0)
+		return __ublksrv_ctrl_add_dev(dev, UBLK_CMD_ADD_DEV);
+
+	return ret;
 }
 
 int ublksrv_ctrl_del_dev(struct ublksrv_ctrl_dev *dev)
@@ -260,23 +288,23 @@ int ublksrv_ctrl_del_dev(struct ublksrv_ctrl_dev *dev)
 	return __ublksrv_ctrl_cmd(dev, &data);
 }
 
-static int __ublksrv_ctrl_get_info(struct ublksrv_ctrl_dev *dev,
+static int __ublksrv_ctrl_get_info_no_trans(struct ublksrv_ctrl_dev *dev,
 		unsigned cmd_op)
 {
 	char buf[UBLKC_PATH_MAX + sizeof(dev->dev_info)];
 	struct ublksrv_ctrl_cmd_data data = {
 		.cmd_op	= cmd_op,
-		.flags	= CTRL_CMD_HAS_BUF,
+		.flags	= CTRL_CMD_HAS_BUF | CTRL_CMD_NO_TRANS,
 		.addr = (__u64)&dev->dev_info,
 		.len = sizeof(struct ublksrv_ctrl_dev_info),
 	};
 	bool has_dev_path = false;
 	int ret;
 
-	if (ublk_is_unprivileged(dev) && data.cmd_op == UBLK_CMD_GET_DEV_INFO)
+	if (ublk_is_unprivileged(dev) && _IOC_NR(data.cmd_op) == UBLK_CMD_GET_DEV_INFO)
 		return -EINVAL;
 
-	if (data.cmd_op == UBLK_CMD_GET_DEV_INFO2) {
+	if (_IOC_NR(data.cmd_op) == UBLK_CMD_GET_DEV_INFO2) {
 		snprintf(buf, UBLKC_PATH_MAX, "%s%d", UBLKC_DEV,
 			dev->dev_info.dev_id);
 		data.flags |= CTRL_CMD_HAS_BUF | CTRL_CMD_HAS_DATA;
@@ -290,6 +318,18 @@ static int __ublksrv_ctrl_get_info(struct ublksrv_ctrl_dev *dev,
 	if (ret >= 0 && has_dev_path)
 		memcpy(&dev->dev_info, &buf[UBLKC_PATH_MAX],
 				sizeof(dev->dev_info));
+	return ret;
+}
+
+static int __ublksrv_ctrl_get_info(struct ublksrv_ctrl_dev *dev,
+		unsigned cmd_op)
+{
+	unsigned new_code = ctrl_cmd_op[cmd_op];
+	int ret = __ublksrv_ctrl_get_info_no_trans(dev, new_code);
+
+	if (ret < 0)
+		ret = __ublksrv_ctrl_get_info_no_trans(dev, cmd_op);
+
 	return ret;
 }
 
